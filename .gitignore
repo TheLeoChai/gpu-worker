@@ -1,0 +1,14 @@
+# runtime secrets -- never commit
+auth.env
+
+# runtime state
+logs/
+*.log
+jobs.json
+jobs.json.tmp.*
+
+# dependencies (npm install to restore)
+node_modules/
+
+# local backups
+*.bak-*
