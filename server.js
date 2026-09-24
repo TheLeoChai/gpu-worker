@@ -15,16 +15,27 @@ const jobman = require("./jobs.js");
 const ROOT = __dirname;
 const PORT = parseInt(process.env.GPU_WORKER_PORT || "4120", 10);
 
-function loadToken() {
+// auth.env holds the owner token (GPU_WORKER_TOKEN) and, optionally, a
+// restricted token for delegated subagents (GPU_WORKER_AGENT_TOKEN, LEO-176).
+function loadTokens() {
   const envPath = process.env.GPU_WORKER_AUTH || path.join(ROOT, "auth.env");
   const text = fs.readFileSync(envPath, "utf8");
+  const found = {};
   for (const line of text.split(/\r?\n/)) {
-    const m = line.match(/^\s*GPU_WORKER_TOKEN\s*=\s*(\S+)\s*$/);
-    if (m) return m[1];
+    const m = line.match(/^\s*(GPU_WORKER_TOKEN|GPU_WORKER_AGENT_TOKEN)\s*=\s*(\S+)\s*$/);
+    if (m) found[m[1]] = m[2];
   }
-  throw new Error("GPU_WORKER_TOKEN not found in " + envPath);
+  if (!found.GPU_WORKER_TOKEN) throw new Error("GPU_WORKER_TOKEN not found in " + envPath);
+  const tokens = [{ role: "owner", buf: Buffer.from(found.GPU_WORKER_TOKEN, "utf8") }];
+  if (found.GPU_WORKER_AGENT_TOKEN && found.GPU_WORKER_AGENT_TOKEN !== found.GPU_WORKER_TOKEN) {
+    tokens.push({ role: "agent", buf: Buffer.from(found.GPU_WORKER_AGENT_TOKEN, "utf8") });
+  }
+  return tokens;
 }
-const TOKEN_BUF = Buffer.from(loadToken(), "utf8");
+const TOKENS = loadTokens();
+
+// Commands the agent role may never submit.
+const AGENT_DENIED_COMMANDS = [/cleanup_persistent_results/i];
 
 let allowedIps = null;
 if (process.env.GPU_WORKER_ALLOWED_IPS) {
@@ -35,17 +46,16 @@ if (process.env.GPU_WORKER_ALLOWED_IPS) {
   );
 }
 
+// Returns the caller's role ("owner" | "agent"), or null when unauthorized.
 function checkAuth(req) {
-  if (allowedIps && !allowedIps.has(req.socket.remoteAddress || "")) return false;
+  if (allowedIps && !allowedIps.has(req.socket.remoteAddress || "")) return null;
   const h = req.headers.authorization || "";
-  if (typeof h !== "string" || !h.startsWith("Bearer ")) return false;
+  if (typeof h !== "string" || !h.startsWith("Bearer ")) return null;
   const got = Buffer.from(h.slice(7), "utf8");
-  if (got.length !== TOKEN_BUF.length) return false;
-  try {
-    return crypto.timingSafeEqual(got, TOKEN_BUF);
-  } catch (e) {
-    return false;
+  for (const t of TOKENS) {
+    if (got.length === t.buf.length && crypto.timingSafeEqual(got, t.buf)) return t.role;
   }
+  return null;
 }
 
 function exec(cmd, args, timeoutMs) {
@@ -69,7 +79,7 @@ function jsonText(obj) {
   return { content: [{ type: "text", text: JSON.stringify(obj, null, 2) }] };
 }
 
-function registerTools(server) {
+function registerTools(server, role) {
   server.registerTool(
     "host_info",
     {
@@ -139,7 +149,10 @@ function registerTools(server) {
       },
     },
     async ({ repo, ref, command, timeout_minutes }) => {
-      const j = jobman.enqueue(repo, ref, command, timeout_minutes);
+      if (role === "agent" && AGENT_DENIED_COMMANDS.some((re) => re.test(command))) {
+        return { isError: true, content: [{ type: "text", text: "command not allowed for agent token" }] };
+      }
+      const j = jobman.enqueue(repo, ref, command, timeout_minutes, role);
       return jsonText({ jobId: j.id });
     }
   );
@@ -164,6 +177,8 @@ function registerTools(server) {
         startedAt: j.startedAt,
         endedAt: j.endedAt,
         checkedOut: j.checkedOut || null,
+        checkoutDrift: j.checkoutDrift || null,
+        submittedBy: j.submittedBy || "owner",
       });
     }
   );
@@ -189,10 +204,17 @@ function registerTools(server) {
     "cancel_job",
     {
       title: "Cancel Job",
-      description: "Cancel a queued or running job (kills the process tree of a running job).",
+      description:
+        "Cancel a queued or running job (kills the process tree of a running job). With the agent token, only queued jobs submitted with the agent token can be cancelled.",
       inputSchema: { jobId: z.string().describe("jobId returned by run_job") },
     },
     async ({ jobId }) => {
+      if (role === "agent") {
+        const j = jobman.getJob(jobId);
+        if (j && (j.submittedBy !== "agent" || j.status !== "queued")) {
+          return jsonText({ ok: false, error: "agent token may only cancel queued jobs it submitted (status=" + j.status + ")" });
+        }
+      }
       const res = await jobman.cancelJob(jobId);
       return jsonText(res.ok ? res : { ok: false, error: res.error });
     }
@@ -227,7 +249,7 @@ function readBody(req) {
   });
 }
 
-async function handleMcp(req, res, bodyBuf) {
+async function handleMcp(req, res, bodyBuf, role) {
   if (req.method === "GET" || req.method === "DELETE") {
     res.writeHead(405, { Allow: "POST", "Content-Type": "application/json" });
     res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed (stateless server)" }, id: null }));
@@ -243,7 +265,7 @@ async function handleMcp(req, res, bodyBuf) {
   }
 
   const server = new McpServer({ name: "desktop-gpu", version: "1.0.0" });
-  registerTools(server);
+  registerTools(server, role);
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
@@ -263,14 +285,15 @@ async function handler(req, res) {
     res.end('{"ok":true}');
     return;
   }
-  if (!checkAuth(req)) {
+  const role = checkAuth(req);
+  if (!role) {
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "unauthorized" }));
     return;
   }
   try {
     const bodyBuf = req.method === "POST" ? await readBody(req) : Buffer.alloc(0);
-    await handleMcp(req, res, bodyBuf);
+    await handleMcp(req, res, bodyBuf, role);
   } catch (e) {
     if (!res.headersSent) {
       res.writeHead(500, { "Content-Type": "application/json" });

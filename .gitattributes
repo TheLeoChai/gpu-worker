@@ -1,0 +1,4 @@
+# Windows launchers must stay CRLF on every checkout.
+*.cmd text eol=crlf
+*.vbs text eol=crlf
+*.exe binary
