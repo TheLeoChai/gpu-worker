@@ -6,7 +6,7 @@ $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 $logFile = Join-Path $root "deploy.log"
 $lockFile = Join-Path $root "deploy.lock"
-$scriptRev = 2
+$scriptRev = 3
 
 function Log([string]$msg) {
   try {
