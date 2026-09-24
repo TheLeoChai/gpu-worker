@@ -12,3 +12,9 @@ node_modules/
 
 # local backups
 *.bak-*
+
+# deploy runtime
+deploy.log
+deploy.log.old
+deploy.lock
+

@@ -306,7 +306,7 @@ namespace GpuWorkerTray
                 foreach (ManagementObject mo in searcher.Get())
                 {
                     string cl = mo["CommandLine"] as string;
-                    if (cl != null && cl.Contains("gpu-worker") && cl.Contains("server.js"))
+                    if (cl != null && cl.Contains("server.js") && !cl.Contains("Adobe"))
                     {
                         pids.Add(Convert.ToInt32(mo["ProcessId"]));
                     }

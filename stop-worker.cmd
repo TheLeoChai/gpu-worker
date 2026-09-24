@@ -1,2 +1,2 @@
 @echo off
-powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -like '*gpu-worker*server.js*' } | ForEach-Object { taskkill /PID $_.ProcessId /T /F }"
+powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -like '*server.js*' -and $_.CommandLine -notlike '*Adobe*' } | ForEach-Object { taskkill /PID $_.ProcessId /T /F }"
