@@ -35,7 +35,7 @@ A self-hosted **remote job runner for your desktop GPU PC** (built for an RTX 40
 | `host_info` | CPU/RAM/disk + GPU name, VRAM, utilization (via `nvidia-smi`) |
 | `gpu_status` | GPU utilization, memory, temperature + running compute apps |
 | `run_job` | Enqueue `{ repo, ref?, command, timeout_minutes? }`. Known short names (`leos-opencode`, `ai-society`) or any git URL. Returns `jobId` |
-| `job_status` | `queued \| running \| done \| failed \| timeout \| cancelled` + exit code + timestamps |
+| `job_status` | `queued \| running \| done \| failed \| timeout \| cancelled` + exit code + timestamps + `checkoutDrift` (files whose checked-out bytes differ from the commit) |
 | `job_log` | Tail of the job's combined stdout/stderr |
 | `cancel_job` | Cancel queued or kill running job (whole process tree) |
 | `list_jobs` | Recent jobs with statuses |
@@ -78,6 +78,7 @@ node smoke-client.js http://127.0.0.1:4120
 - Every non-`/health` request requires `Authorization: Bearer <token>`.
 - The token lives in `auth.env` (gitignored): `GPU_WORKER_TOKEN=<random secret>`.
 - Token comparison is constant-time (`crypto.timingSafeEqual`).
+- Optional restricted token for delegated agents: `GPU_WORKER_AGENT_TOKEN=<another secret>` in the same `auth.env` (see [Subagent access](#subagent-access)).
 - Optional IP allowlist via `GPU_WORKER_ALLOWED_IPS` (comma-separated).
 
 ### Job lifecycle
@@ -87,9 +88,49 @@ enqueue ──▶ queued ──▶ running ──▶ done | failed | timeout | c
                 └─ cancel   └─ cancel kills process tree (taskkill /T /F)
 ```
 - `run_job` rejects immediately (before queueing) if workspace drive free space < `GPU_WORKER_MIN_FREE_GB`.
-- Each job gets an isolated workspace: `<WORKSPACES>/<jobId>/`, clone with `--no-checkout`, checkout `ref` (fetches it if missing), then the command runs with `cwd` = repo root via `cmd.exe`, with `GPU_WORKER_JOB_ID` in the environment.
+- Each job gets an isolated workspace: `<WORKSPACES>/<jobId>/`, clone with `--no-checkout`, checkout `ref` (fetches it if missing), then the command runs with `cwd` = repo root via `cmd.exe`, with `GPU_WORKER_JOB_ID` and `GPU_WORKER_TOOLS` (this repo's `tools\` dir) in the environment.
+- After checkout the worker compares every file against its committed blob and logs a warning (plus `checkoutDrift` in `job_status`) for bytes rewritten without a `.gitattributes` rule, then logs the GPU compute apps it sees right before launch. Both are diagnostics only; they never block the job.
 - Output is streamed to `job.log` (10 MB cap per job); on completion the log is copied to `logs/<jobId>.log` and the workspace becomes eligible for retention sweeps.
 - History is capped at 100 jobs in `jobs.json`.
+
+## Transfer-bundle tools
+
+The GPU PC's global git config has `core.autocrlf=true`, so any file without a `.gitattributes` rule is checked out with CRLF line endings. Anything hash-bound to committed bytes breaks (LEO-182). Three stdlib-only tools in `tools/` cover the recurring transfer failures. Jobs reach them through `%GPU_WORKER_TOOLS%`.
+
+| Tool | Run it | Fails when |
+|---|---|---|
+| `verify-checkout.js [--require-eol-lock] [--json] [path...]` | first step of the job's launcher on the PC; also on the builder before submitting | a tracked file's working-tree bytes differ from its committed blob, or (with `--require-eol-lock`) a file lacks an eol lock |
+| `import_closure.py ENTRY.py... --root REPO [--path DIR]... [--bundle DIR] [--out import_map.json]` | on the bundle builder, before freezing the bundle | an import (including function-level and `importlib.import_module("x")` imports) names a repo module outside the search path, or `--bundle` is missing a closure file or has different bytes |
+| `gpu_idle_check.py [--probes 3] [--interval 5]` (or `from gpu_idle_check import wait_for_idle_gpu`) | in the job's GPU preflight, instead of one `nvidia-smi` probe | every probe (3 over ~10 s by default) saw a compute process. The JSON result lists each probe's processes so the refusal receipt can be diagnosed |
+
+Transfer checklist rules:
+
+1. **Every transfer dir carries an eol lock.** Its `.gitattributes` must mark the files `-text` (or `text eol=lf`). This includes wrappers that get hash-verified. `node "%GPU_WORKER_TOOLS%\verify-checkout.js" --require-eol-lock results\<dir>` enforces this, so run it before any hash check and refuse on a non-zero exit.
+2. **Import lists are generated, never hand-written.** Build `import_map.json` with `import_closure.py` from the bundle's entry scripts, then re-run with `--bundle <extracted dir>`. Keep the isolated import dry-run as the last gate.
+3. **Occupancy checks retry.** Use `wait_for_idle_gpu()` and put its `probes` in the refusal message.
+
+## Subagent access
+
+The owner token stays with the orchestrator. To let agent-hub subagents submit jobs directly, add a second secret to `auth.env` (`GPU_WORKER_AGENT_TOKEN=...`), restart the worker, and pass the server as an ACP entry in `agent_dispatch`:
+
+```json
+"mcp_servers": [{
+  "type": "http", "name": "desktop-gpu",
+  "url": "http://100.107.19.56:4120/mcp",
+  "headers": [{ "name": "Authorization", "value": "Bearer <GPU_WORKER_AGENT_TOKEN>" }]
+}]
+```
+
+The worker enforces the guardrails whichever token is used. Only the agent-specific ones depend on the agent token:
+
+| Guardrail | Enforcement |
+|---|---|
+| serialized jobs | single FIFO queue, one job at a time (all tokens) |
+| ≥100 GB free before a job | `run_job` refuses below `GPU_WORKER_MIN_FREE_GB` (all tokens) |
+| never terminate healthy jobs | agent token: `cancel_job` only works on **queued** jobs submitted with the agent token; running jobs need the owner |
+| no `cleanup_persistent_results.py` | agent token: `run_job` rejects commands that mention it |
+
+Jobs record `submittedBy` (`owner` / `agent`) in `job_status` and `list_jobs`. The ACP adapter must support HTTP MCP servers (`mcpCapabilities.http`). If a provider doesn't support them, that provider stays orchestrator-only, and its dispatch prompts must not assume the tools exist.
 
 ## Files
 
@@ -99,12 +140,13 @@ enqueue ──▶ queued ──▶ running ──▶ done | failed | timeout | c
 | `jobs.js` | Queue, job runner, retention sweeps, orphan cleanup |
 | `tray/GpuWorkerTray.cs` | Tray app source (C# / WinForms, compiled with .NET Framework `csc`) |
 | `GpuWorkerTray.exe` | Compiled tray app |
-| `auth.env` | Bearer token (**secret, gitignored**) |
+| `auth.env` | Bearer tokens: owner + optional agent (**secret, gitignored**) |
 | `jobs.json` | Persisted job state (**runtime, gitignored**) |
 | `start-worker.cmd` / `stop-worker.cmd` | Start/stop worker (portable, use `%~dp0`) |
 | `launch-worker.vbs`, `*-hidden.vbs` | Silent wrappers for scheduled tasks / tray |
 | `smoke-client.js` | End-to-end smoke test (connect, list tools, run a job) |
 | `check-fs.js`, `status-one.js`, `retention-e2e.js` | Maintenance/test helpers |
+| `tools/` | Transfer-bundle tools, exposed to jobs as `%GPU_WORKER_TOOLS%` (see above) |
 | `logs/` | Preserved per-job logs + `worker.log` / `tray.log` (**gitignored**) |
 
 ## Install (fresh machine)

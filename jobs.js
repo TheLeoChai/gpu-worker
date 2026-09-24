@@ -4,8 +4,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawn, execFile } = require("node:child_process");
+const { verifyCheckout } = require("./tools/verify-checkout.js");
 
 const ROOT = __dirname;
+const TOOLS_DIR = path.join(ROOT, "tools");
 const WORKSPACES = process.env.GPU_WORKER_WORKSPACES || "F:\\gpu-worker-workspaces";
 const LOGS_DIR = process.env.GPU_WORKER_LOGS_DIR || path.join(ROOT, "logs");
 const JOBS_FILE = process.env.GPU_WORKER_JOBS_FILE || path.join(ROOT, "jobs.json");
@@ -288,11 +290,31 @@ async function runJob(id) {
       j.checkedOut = target;
     }
 
+    // Diagnostics only (LEO-182): report files whose checked-out bytes differ
+    // from the committed blob without .gitattributes asking for it. Jobs that
+    // hash-verify should gate on tools/verify-checkout.js themselves.
+    try {
+      const v = await verifyCheckout(ws);
+      const drift = v.drift.filter((d) => !d.intentional);
+      if (drift.length) {
+        j.checkoutDrift = { count: drift.length, paths: drift.slice(0, 20).map((d) => d.path) };
+        appendLog(j, "[worker] WARNING: " + drift.length + " file(s) differ from committed bytes after checkout " +
+          "(line-ending rewrite?): " + j.checkoutDrift.paths.join(", ") + "\r\n");
+      }
+    } catch (e) {
+      appendLog(j, "[worker] checkout verification skipped: " + ((e && e.message) || e) + "\r\n");
+    }
+
+    // GPU occupancy as seen right before launch, so a job's own preflight
+    // refusal can be compared against it (LEO-179).
+    const gpuApps = await exec("nvidia-smi", ["--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader"]);
+    appendLog(j, "[worker] GPU compute apps at launch: " + (gpuApps.ok ? gpuApps.stdout.trim() || "(none)" : "(nvidia-smi failed)") + "\r\n");
+
     child = spawn("cmd.exe", ["/d", "/s", "/c", j.command], {
       cwd: ws,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
-      env: Object.assign({}, process.env, { GPU_WORKER_JOB_ID: id }),
+      env: Object.assign({}, process.env, { GPU_WORKER_JOB_ID: id, GPU_WORKER_TOOLS: TOOLS_DIR }),
     });
     j.pid = child.pid;
     persistJobs();
@@ -361,7 +383,7 @@ async function runJob(id) {
   setImmediate(pumpQueue);
 }
 
-function enqueue(repo, ref, command, timeoutMinutes) {
+function enqueue(repo, ref, command, timeoutMinutes, submittedBy) {
   assertDiskSpace();
   const id = crypto.randomUUID();
   jobs[id] = {
@@ -369,6 +391,7 @@ function enqueue(repo, ref, command, timeoutMinutes) {
     repo,
     ref: ref || null,
     command,
+    submittedBy: submittedBy || "owner",
     timeoutMinutes: timeoutMinutes > 0 ? Math.min(timeoutMinutes, 240) : 30,
     status: "queued",
     queuedAt: new Date().toISOString(),
@@ -395,6 +418,7 @@ function listJobs() {
       repo: j.repo,
       ref: j.ref,
       command: j.command,
+      submittedBy: j.submittedBy || "owner",
       status: j.status,
       queuedAt: j.queuedAt,
       startedAt: j.startedAt,
