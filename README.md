@@ -32,13 +32,15 @@ A self-hosted **remote job runner for your desktop GPU PC** (built for an RTX 40
 
 | Tool | Description |
 |---|---|
-| `host_info` | CPU/RAM/disk + GPU name, VRAM, utilization (via `nvidia-smi`) |
+| `host_info` | CPU/RAM/disk + GPU name, VRAM, utilization (via `nvidia-smi`) + allowlisted `artifactRoots` |
 | `gpu_status` | GPU utilization, memory, temperature + running compute apps |
 | `run_job` | Enqueue `{ repo, ref?, command, timeout_minutes? }`. Known short names (`leos-opencode`, `ai-society`) or any git URL. Returns `jobId` |
 | `job_status` | `queued \| running \| done \| failed \| timeout \| cancelled` + exit code + timestamps + `checkoutDrift` (files whose checked-out bytes differ from the commit) |
 | `job_log` | Tail of the job's combined stdout/stderr |
 | `cancel_job` | Cancel queued or kill running job (whole process tree) |
 | `list_jobs` | Recent jobs with statuses |
+| `list_job_artifacts` | Read-only manifest (size + `sha256` + download URL per file) of a job workspace or an allowlisted checkout |
+| `get_job_artifact` | One bounded, resumable chunk of a single artifact file (base64 or utf8) |
 
 ## Client setup
 
@@ -93,6 +95,59 @@ enqueue ──▶ queued ──▶ running ──▶ done | failed | timeout | c
 - Output is streamed to `job.log` (10 MB cap per job); on completion the log is copied to `logs/<jobId>.log` and the workspace becomes eligible for retention sweeps.
 - History is capped at 100 jobs in `jobs.json`.
 
+## Artifact retrieval (read-only)
+
+Job logs summarise; audits need the bytes. `list_job_artifacts` / `get_job_artifact` and the
+`/artifact` HTTP endpoint hand out **copies** of files already on the PC (LEO-184) — no job runs,
+nothing is written, committed, pushed or published, and the source tree is never modified.
+
+Two scopes, exactly one per call:
+
+| Scope | Addresses | Notes |
+|---|---|---|
+| `jobId` | that job's retained workspace | only while the workspace is inside the keep-N window (see `retainedWorkspaces`) |
+| `root` | an allowlisted persistent checkout | names come from `GPU_WORKER_ARTIFACT_ROOTS`, listed in `host_info.artifactRoots` |
+
+```
+GPU_WORKER_ARTIFACT_ROOTS=ai-society=F:\Github\AI-society;other=D:\some\dir   # default: the ai-society entry
+GPU_WORKER_ARTIFACT_HASH_MAX_GB=8                                             # refuse to hash more than this per manifest
+```
+
+Typical audit flow (all read-only, from any machine on the tailnet):
+
+```bash
+# 1. manifest: every file with size + sha256 + its download URL
+node mcp-call.mjs list_job_artifacts '{"root":"ai-society","path":"results/.../runtime_receipts/attempt_1"}'
+
+# 2. copy the whole directory to Linux and verify it against that manifest
+GPU_WORKER_TOKEN=<token> node tools/fetch-artifacts.mjs \
+  --host http://<host>:4120 --root ai-society \
+  --path results/.../runtime_receipts/attempt_1 --out /tmp/attempt_1
+# -> FETCH_OK files=<n> bytes=<n> copied=<n> manifest=/tmp/attempt_1.manifest.json
+
+# 3. or pull a single file/chunk by hand
+curl -H "Authorization: Bearer <token>" \
+  "http://<host>:4120/artifact/root/ai-society/results/.../seal.json?sha256=1" -o seal.json
+```
+
+`GET|HEAD /artifact/<job|root>/<name>/<relative/path>` (same Bearer token as `/mcp`, same tailnet
+port, no public endpoint):
+
+- `?manifest=1[&hashes=0]` on a directory → JSON manifest; a plain `GET` on a file → its bytes.
+- `Accept-Ranges: bytes`; `Range` requests answer `206` with `Content-Range`, so an interrupted
+  copy resumes instead of restarting. Unsatisfiable ranges → `416`.
+- `ETag` = size+mtime. Send `If-Match` when resuming: a source file that changed answers `412`
+  rather than splicing mismatched bytes. `?sha256=1` adds an `X-Artifact-SHA256` header.
+- `POST`/`PUT`/`DELETE` → `405`. Absolute paths, drive letters, UNC, `..` and symlinks → `400`;
+  missing artifacts → `404`; purged workspaces → `404` naming the retention window.
+- `get_job_artifact` caps a chunk at 1 MiB (default 64 KiB) — it exists for peeking at a file,
+  not for moving gigabytes through an LLM transcript; use the HTTP endpoint or the fetch tool.
+
+`tools/fetch-artifacts.mjs` is the copy-only client: it fetches the manifest, downloads each file
+(resuming from `<file>.part`, discarding a partial whose `ETag` no longer matches), verifies every
+sha256 before renaming into place, and writes the manifest next to the copy as
+`<out>.manifest.json`. It exits non-zero on any size/hash mismatch.
+
 ## Transfer-bundle tools
 
 The GPU PC's global git config has `core.autocrlf=true`, so any file without a `.gitattributes` rule is checked out with CRLF line endings. Anything hash-bound to committed bytes breaks (LEO-182). Three stdlib-only tools in `tools/` cover the recurring transfer failures. Jobs reach them through `%GPU_WORKER_TOOLS%`.
@@ -138,6 +193,7 @@ Jobs record `submittedBy` (`owner` / `agent`) in `job_status` and `list_jobs`. T
 |---|---|
 | `server.js` | HTTP + MCP server, auth, nvidia-smi tools, Tailscale binding |
 | `jobs.js` | Queue, job runner, retention sweeps, orphan cleanup |
+| `artifacts.js` | Read-only artifact scopes, path validation, manifests, chunk/range reads |
 | `tray/GpuWorkerTray.cs` | Tray app source (C# / WinForms, compiled with .NET Framework `csc`) |
 | `GpuWorkerTray.exe` | Compiled tray app |
 | `auth.env` | Bearer tokens: owner + optional agent (**secret, gitignored**) |
@@ -146,7 +202,9 @@ Jobs record `submittedBy` (`owner` / `agent`) in `job_status` and `list_jobs`. T
 | `launch-worker.vbs`, `*-hidden.vbs` | Silent wrappers for scheduled tasks / tray |
 | `smoke-client.js` | End-to-end smoke test (connect, list tools, run a job) |
 | `check-fs.js`, `status-one.js`, `retention-e2e.js` | Maintenance/test helpers |
+| `artifacts-e2e.js` | Self-contained artifact-retrieval e2e (spawns its own server on port 4199; submits no jobs) |
 | `tools/` | Transfer-bundle tools, exposed to jobs as `%GPU_WORKER_TOOLS%` (see above) |
+| `tools/fetch-artifacts.mjs` | Copy-only artifact fetcher (manifest + resumable download + sha256 verify) |
 | `logs/` | Preserved per-job logs + `worker.log` / `tray.log` (**gitignored**) |
 
 ## Install (fresh machine)
