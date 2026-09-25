@@ -11,6 +11,7 @@ const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
 const { z } = require("zod");
 const jobman = require("./jobs.js");
+const artifacts = require("./artifacts.js");
 
 const ROOT = __dirname;
 const PORT = parseInt(process.env.GPU_WORKER_PORT || "4120", 10);
@@ -79,7 +80,7 @@ function jsonText(obj) {
   return { content: [{ type: "text", text: JSON.stringify(obj, null, 2) }] };
 }
 
-function registerTools(server, role) {
+function registerTools(server, role, host) {
   server.registerTool(
     "host_info",
     {
@@ -107,6 +108,7 @@ function registerTools(server, role) {
         workspaceDiskFreeGB: diskFree,
         workspaceMinFreeGB: jobman.MIN_FREE_GB,
         retainedWorkspaces: jobman.KEEP_WORKSPACES,
+        artifactRoots: artifacts.listRoots(),
       });
     }
   );
@@ -220,6 +222,98 @@ function registerTools(server, role) {
     }
   );
 
+  // Read-only artifact retrieval (LEO-184). Bytes never leave through an LLM
+  // response unless the caller explicitly asks for a chunk: the manifest hands
+  // back authenticated /artifact URLs that resume with HTTP Range.
+  server.registerTool(
+    "list_job_artifacts",
+    {
+      title: "List Job Artifacts",
+      description:
+        "Read-only manifest of a job workspace or an allowlisted persistent checkout on the GPU PC: every file with size, mtime and sha256, plus an authenticated download URL per file. Pass exactly one of jobId (its retained workspace) or root (an allowlisted path, see artifactRoots in host_info) and an optional relative path to narrow to a subdirectory or single file. Nothing is created, modified or committed; symlinks, absolute paths and '..' are rejected. Use the returned downloadBase/URLs (HTTP Range, resumable) or tools/fetch-artifacts.mjs for bulk copies, and get_job_artifact for small chunks.",
+      inputSchema: {
+        jobId: z.string().optional().describe("jobId whose workspace to read (mutually exclusive with root)"),
+        root: z.string().optional().describe("Allowlisted artifact root name (see host_info.artifactRoots)"),
+        path: z.string().optional().describe("Relative path inside the scope (default: whole scope)"),
+        hashes: z.boolean().optional().describe("Compute sha256 per file (default true)"),
+        maxEntries: z.number().optional().describe("Max files to list (default 2000, hard cap 20000)"),
+      },
+    },
+    async ({ jobId, root, path: relPath, hashes, maxEntries }) => {
+      try {
+        const scope = artifacts.resolveScope({ jobId, root });
+        const target = artifacts.safeResolve(scope.base, relPath);
+        const man = artifacts.manifest(target, { hashes, maxEntries });
+        const downloadBase = artifacts.urlFor(host, scope.scope, scope.name, man.path);
+        return jsonText({
+          scope: scope.scope,
+          name: scope.name,
+          base: scope.base,
+          sourcePath: path.join(scope.base, man.path.split("/").join(path.sep)),
+          kind: man.kind,
+          path: man.path,
+          fileCount: man.fileCount,
+          totalBytes: man.totalBytes,
+          truncated: man.truncated,
+          maxEntries: man.maxEntries,
+          hashAlgorithm: man.hashAlgorithm,
+          downloadBase,
+          manifestUrl: downloadBase + "?manifest=1",
+          fetchCommand:
+            'GPU_WORKER_TOKEN=<token> node tools/fetch-artifacts.mjs --url "' + downloadBase + '" --out <dir>',
+          files: man.files.map((f) => Object.assign({}, f, {
+            url: artifacts.urlFor(host, scope.scope, scope.name, man.kind === "file" ? man.path : man.path ? man.path + "/" + f.path : f.path),
+          })),
+          skipped: man.skipped,
+        });
+      } catch (e) {
+        return { isError: true, content: [{ type: "text", text: String((e && e.message) || e) }] };
+      }
+    }
+  );
+
+  server.registerTool(
+    "get_job_artifact",
+    {
+      title: "Get Job Artifact",
+      description:
+        "Read one bounded chunk of a single artifact file, read-only. Pass exactly one of jobId or root plus the relative path; offset/length make an interrupted read resumable (default 64 KiB, max 1 MiB per call). Returns the full file size, its etag, the chunk's own sha256 and the bytes (base64, or utf8 text on request). For whole directories or large files prefer the /artifact download URLs from list_job_artifacts.",
+      inputSchema: {
+        jobId: z.string().optional().describe("jobId whose workspace to read (mutually exclusive with root)"),
+        root: z.string().optional().describe("Allowlisted artifact root name (see host_info.artifactRoots)"),
+        path: z.string().describe("Relative path of the file inside the scope"),
+        offset: z.number().optional().describe("Byte offset to start at (default 0)"),
+        length: z.number().optional().describe("Bytes to read (default 65536, max 1048576)"),
+        encoding: z.enum(["base64", "utf8"]).optional().describe("Chunk encoding (default base64)"),
+      },
+    },
+    async ({ jobId, root, path: relPath, offset, length, encoding }) => {
+      try {
+        const scope = artifacts.resolveScope({ jobId, root });
+        const target = artifacts.safeResolve(scope.base, relPath);
+        const chunk = artifacts.readChunk(target, offset, length);
+        const enc = encoding === "utf8" ? "utf8" : "base64";
+        return jsonText({
+          scope: scope.scope,
+          name: scope.name,
+          path: target.rel,
+          sourcePath: target.abs,
+          bytes: chunk.bytes,
+          etag: chunk.etag,
+          offset: chunk.offset,
+          length: chunk.length,
+          eof: chunk.eof,
+          encoding: enc,
+          chunkSha256: chunk.chunkSha256,
+          downloadUrl: artifacts.urlFor(host, scope.scope, scope.name, target.rel),
+          data: chunk.data.toString(enc),
+        });
+      } catch (e) {
+        return { isError: true, content: [{ type: "text", text: String((e && e.message) || e) }] };
+      }
+    }
+  );
+
   server.registerTool(
     "list_jobs",
     {
@@ -249,6 +343,92 @@ function readBody(req) {
   });
 }
 
+// GET/HEAD /artifact/<job|root>/<name>/<relative/path>
+//   ?manifest=1[&hashes=0]  -> JSON manifest (sha256 + size per file)
+//   otherwise               -> the file's bytes, read-only, Range-resumable.
+// Callers resuming a partial copy should send If-Match with the etag they
+// started from: a changed file answers 412 instead of splicing mismatched bytes.
+async function handleArtifact(req, res, rawUrl) {
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    res.writeHead(405, { Allow: "GET, HEAD", "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "method not allowed" }));
+    return;
+  }
+  const u = new URL(rawUrl, "http://localhost");
+  let segments;
+  try {
+    segments = u.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+  } catch (e) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "malformed percent-encoding in path" }));
+    return;
+  }
+  try {
+    const kind = segments[1];
+    const name = segments[2];
+    const rel = segments.slice(3).join("/");
+    if (!name || (kind !== "job" && kind !== "root")) {
+      throw artifacts.badRequest("expected /artifact/job/<jobId>/<path> or /artifact/root/<name>/<path>");
+    }
+    const scope = artifacts.resolveScope(kind === "job" ? { jobId: name } : { root: name });
+    const target = artifacts.safeResolve(scope.base, rel);
+
+    if (u.searchParams.get("manifest") === "1") {
+      const man = artifacts.manifest(target, { hashes: u.searchParams.get("hashes") !== "0" });
+      const body = Buffer.from(JSON.stringify(Object.assign({ scope: scope.scope, name: scope.name, base: scope.base }, man), null, 2));
+      res.writeHead(200, { "Content-Type": "application/json", "Content-Length": body.length });
+      res.end(req.method === "HEAD" ? undefined : body);
+      return;
+    }
+    if (target.stat.isDirectory()) {
+      throw artifacts.badRequest("that is a directory; add ?manifest=1 for its listing, or request a file inside it");
+    }
+    if (!target.stat.isFile()) throw artifacts.badRequest("not a regular file: " + target.rel);
+
+    const size = target.stat.size;
+    const etag = artifacts.etagFor(target.stat);
+    const ifMatch = req.headers["if-match"];
+    if (ifMatch && ifMatch !== "*" && !String(ifMatch).split(",").map((s) => s.trim()).includes(etag)) {
+      res.writeHead(412, { "Content-Type": "application/json", ETag: etag });
+      res.end(JSON.stringify({ error: "artifact changed since etag " + ifMatch + " (now " + etag + "); restart the transfer" }));
+      return;
+    }
+    const range = artifacts.parseRange(req.headers.range, size);
+    if (range === false) {
+      res.writeHead(416, { "Content-Range": "bytes */" + size, "Content-Type": "application/json", ETag: etag });
+      res.end(JSON.stringify({ error: "unsatisfiable range for a " + size + "-byte artifact" }));
+      return;
+    }
+    const start = range ? range.start : 0;
+    const end = range ? range.end : size - 1;
+    const headers = {
+      "Content-Type": "application/octet-stream",
+      "Content-Length": size === 0 ? 0 : end - start + 1,
+      "Accept-Ranges": "bytes",
+      ETag: etag,
+      "Last-Modified": new Date(target.stat.mtimeMs).toUTCString(),
+      "Cache-Control": "no-store",
+      "X-Artifact-Path": target.rel,
+      "X-Artifact-Bytes": String(size),
+    };
+    if (u.searchParams.get("sha256") === "1") headers["X-Artifact-SHA256"] = artifacts.sha256File(target.abs);
+    if (range) headers["Content-Range"] = "bytes " + start + "-" + end + "/" + size;
+    res.writeHead(range ? 206 : 200, headers);
+    if (req.method === "HEAD" || size === 0) {
+      res.end();
+      return;
+    }
+    const stream = fs.createReadStream(target.abs, { start, end, flags: "r" });
+    res.on("close", () => stream.destroy());
+    stream.on("error", () => res.destroy());
+    stream.pipe(res);
+  } catch (e) {
+    const status = e instanceof artifacts.ArtifactError ? e.status : 500;
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: String((e && e.message) || e) }));
+  }
+}
+
 async function handleMcp(req, res, bodyBuf, role) {
   if (req.method === "GET" || req.method === "DELETE") {
     res.writeHead(405, { Allow: "POST", "Content-Type": "application/json" });
@@ -265,7 +445,7 @@ async function handleMcp(req, res, bodyBuf, role) {
   }
 
   const server = new McpServer({ name: "desktop-gpu", version: "1.0.0" });
-  registerTools(server, role);
+  registerTools(server, role, req.headers.host || "127.0.0.1:" + PORT);
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
@@ -292,6 +472,10 @@ async function handler(req, res) {
     return;
   }
   try {
+    if (url === "/artifact" || url.startsWith("/artifact/") || url.startsWith("/artifact?")) {
+      await handleArtifact(req, res, url);
+      return;
+    }
     const bodyBuf = req.method === "POST" ? await readBody(req) : Buffer.alloc(0);
     await handleMcp(req, res, bodyBuf, role);
   } catch (e) {
